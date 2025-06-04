@@ -565,4 +565,441 @@ resource "azurerm_subnet_network_security_group_association" "azure_arc" {
   network_security_group_id = azurerm_network_security_group.azure_arc.id
 }
 
-# Continue met VPN Gateway, Security, Storage, Monitoring, en Compute in volgende delen...
+# ==============================================================================
+# VPN GATEWAY RESOURCES - ENHANCED VOOR MULTI-SITE
+# ==============================================================================
+
+# VPN Gateway Public IP
+resource "azurerm_public_ip" "vpn_gateway" {
+  name                = "pip-${var.project_name}-vpn-gw"
+  location            = azurerm_resource_group.network.location
+  resource_group_name = azurerm_resource_group.network.name
+  allocation_method   = "Static"
+  sku                = "Standard"
+
+  tags = local.common_tags
+}
+
+# Virtual Network Gateway (Enhanced voor Enterprise)
+resource "azurerm_virtual_network_gateway" "vpn" {
+  name                = "vng-${var.project_name}-vpn"
+  location            = azurerm_resource_group.network.location
+  resource_group_name = azurerm_resource_group.network.name
+
+  type     = "Vpn"
+  vpn_type = "RouteBased"
+  sku      = "VpnGw2"  # Upgraded van VpnGw1 voor betere performance
+  generation = "Generation2"  # Voor betere throughput
+
+  ip_configuration {
+    name                          = "vnetGatewayConfig"
+    public_ip_address_id          = azurerm_public_ip.vpn_gateway.id
+    private_ip_address_allocation = "Dynamic"
+    subnet_id                     = azurerm_subnet.gateway.id
+  }
+
+  tags = local.common_tags
+}
+
+# Local Network Gateway - Hoofdkantoor (Huidige Setup)
+resource "azurerm_local_network_gateway" "hoofdkantoor" {
+  name                = "lng-${var.project_name}-hoofdkantoor"
+  resource_group_name = azurerm_resource_group.network.name
+  location            = azurerm_resource_group.network.location
+  gateway_address     = var.hoofdkantoor_gateway_ip  # 145.220.74.133
+  
+  # Alle huidige VLANs
+  address_space = [
+    "192.168.1.0/24",  # VLAN A
+    "192.168.2.0/24",  # VLAN B
+    "192.168.3.0/24"   # VLAN C
+  ]
+
+  tags = local.common_tags
+}
+
+# VPN Connection - Hoofdkantoor
+resource "azurerm_virtual_network_gateway_connection" "hoofdkantoor" {
+  name                = "conn-${var.project_name}-hoofdkantoor"
+  location            = azurerm_resource_group.network.location
+  resource_group_name = azurerm_resource_group.network.name
+
+  type                       = "IPsec"
+  virtual_network_gateway_id = azurerm_virtual_network_gateway.vpn.id
+  local_network_gateway_id   = azurerm_local_network_gateway.hoofdkantoor.id
+
+  shared_key = var.vpn_shared_key
+
+  tags = local.common_tags
+}
+
+# Placeholder Local Network Gateways voor toekomstige vakantieparken
+resource "azurerm_local_network_gateway" "vakantiepark_nl" {
+  name                = "lng-${var.project_name}-vakantiepark-nl"
+  resource_group_name = azurerm_resource_group.network.name
+  location            = azurerm_resource_group.network.location
+  gateway_address     = "1.2.3.4"  # Placeholder - later in te vullen
+  address_space       = [var.vakantiepark_nl_cidr]
+
+  tags = merge(local.common_tags, {
+    Status = "placeholder-future-deployment"
+  })
+}
+
+resource "azurerm_local_network_gateway" "vakantiepark_be" {
+  name                = "lng-${var.project_name}-vakantiepark-be"
+  resource_group_name = azurerm_resource_group.network.name
+  location            = azurerm_resource_group.network.location
+  gateway_address     = "1.2.3.5"  # Placeholder - later in te vullen
+  address_space       = [var.vakantiepark_be_cidr]
+
+  tags = merge(local.common_tags, {
+    Status = "placeholder-future-deployment"
+  })
+}
+
+resource "azurerm_local_network_gateway" "vakantiepark_de" {
+  name                = "lng-${var.project_name}-vakantiepark-de"
+  resource_group_name = azurerm_resource_group.network.name
+  location            = azurerm_resource_group.network.location
+  gateway_address     = "1.2.3.6"  # Placeholder - later in te vullen
+  address_space       = [var.vakantiepark_de_cidr]
+
+  tags = merge(local.common_tags, {
+    Status = "placeholder-future-deployment"
+  })
+}
+
+# Configure VNet DNS voor hybrid resolution
+resource "azurerm_virtual_network_dns_servers" "main" {
+  virtual_network_id = azurerm_virtual_network.azure_enterprise.id
+  dns_servers        = var.on_premises_dns_servers  # FONTDC01: 192.168.2.100
+}
+
+# ==============================================================================
+# SECURITY RESOURCES - ENHANCED ENTERPRISE
+# ==============================================================================
+
+resource "azurerm_resource_group" "security" {
+  name     = "rg-${var.project_name}-security"
+  location = var.location
+  tags     = local.common_tags
+}
+
+resource "random_string" "kv_suffix" {
+  length  = 4
+  special = false
+  upper   = false
+}
+
+# Key Vault - Enhanced voor Enterprise
+resource "azurerm_key_vault" "main" {
+  name                = "kv-${var.project_name}-${random_string.kv_suffix.result}"
+  location            = azurerm_resource_group.security.location
+  resource_group_name = azurerm_resource_group.security.name
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  sku_name            = "premium"  # Upgraded voor enterprise features
+
+  # Enhanced security settings
+  enabled_for_disk_encryption     = true
+  enabled_for_deployment          = true
+  enabled_for_template_deployment = true
+  purge_protection_enabled        = var.environment == "prod"
+  soft_delete_retention_days      = 90
+
+  network_acls {
+    default_action = "Deny"
+    bypass         = "AzureServices"
+    
+    # Allow access from Azure subnets
+    virtual_network_subnet_ids = [
+      azurerm_subnet.management.id,
+      azurerm_subnet.azure_arc.id
+    ]
+    
+    # Allow access from on-premises
+    ip_rules = [
+      "192.168.1.0/24",  # VLAN A
+      "192.168.2.0/24",  # VLAN B  
+      "192.168.3.0/24"   # VLAN C
+    ]
+  }
+
+  tags = local.common_tags
+}
+
+resource "azurerm_key_vault_access_policy" "current_user" {
+  key_vault_id = azurerm_key_vault.main.id
+  tenant_id    = data.azurerm_client_config.current.tenant_id
+  object_id    = data.azurerm_client_config.current.object_id
+
+  secret_permissions = [
+    "Set", "Get", "List", "Delete", "Backup", "Restore", "Recover", "Purge"
+  ]
+
+  key_permissions = [
+    "Create", "Get", "List", "Update", "Delete", "Backup", "Restore", "Recover", "Purge"
+  ]
+
+  certificate_permissions = [
+    "Create", "Get", "List", "Update", "Delete", "Import", "Backup", "Restore", "Recover", "Purge"
+  ]
+}
+
+# Enterprise Secrets
+resource "azurerm_key_vault_secret" "sql_admin_password" {
+  name         = "sql-admin-password"
+  value        = random_password.sql_admin.result
+  key_vault_id = azurerm_key_vault.main.id
+
+  depends_on = [azurerm_key_vault_access_policy.current_user]
+  tags       = local.common_tags
+}
+
+resource "azurerm_key_vault_secret" "vpn_shared_key" {
+  name         = "vpn-shared-key-hoofdkantoor"
+  value        = var.vpn_shared_key
+  key_vault_id = azurerm_key_vault.main.id
+
+  depends_on = [azurerm_key_vault_access_policy.current_user]
+  tags       = local.common_tags
+}
+
+# Domain service account passwords (placeholders)
+resource "random_password" "domain_service_account" {
+  length  = 24
+  special = true
+  upper   = true
+  lower   = true
+  numeric = true
+}
+
+resource "azurerm_key_vault_secret" "domain_service_account" {
+  name         = "domain-service-account-password"
+  value        = random_password.domain_service_account.result
+  key_vault_id = azurerm_key_vault.main.id
+
+  depends_on = [azurerm_key_vault_access_policy.current_user]
+  tags       = local.common_tags
+}
+
+# ==============================================================================
+# STORAGE RESOURCES - ENTERPRISE LEVEL
+# ==============================================================================
+
+resource "azurerm_resource_group" "storage" {
+  name     = "rg-${var.project_name}-storage"
+  location = var.location
+  tags     = local.common_tags
+}
+
+resource "random_string" "storage_suffix" {
+  length  = 4
+  special = false
+  upper   = false
+}
+
+# Primary Storage Account - Enterprise features
+resource "azurerm_storage_account" "main" {
+  name                     = "st${replace(var.project_name, "-", "")}files${random_string.storage_suffix.result}"
+  resource_group_name      = azurerm_resource_group.storage.name
+  location                 = azurerm_resource_group.storage.location
+  account_tier             = "Premium"  # Upgraded voor enterprise performance
+  account_replication_type = "ZRS"      # Zone Redundant Storage voor HA
+
+  # Enterprise security features
+  https_traffic_only_enabled = true
+  min_tls_version           = "TLS1_2"
+  
+  blob_properties {
+    delete_retention_policy {
+      days = 30  # Longer retention
+    }
+    versioning_enabled = true
+    change_feed_enabled = true
+  }
+
+  network_rules {
+    default_action = "Deny"
+    bypass         = ["AzureServices"]
+    
+    virtual_network_subnet_ids = [
+      azurerm_subnet.frontend.id,
+      azurerm_subnet.backend.id,
+      azurerm_subnet.management.id
+    ]
+    
+    ip_rules = [
+      "192.168.1.0/24",  # VLAN A
+      "192.168.2.0/24",  # VLAN B
+      "192.168.3.0/24"   # VLAN C
+    ]
+  }
+
+  tags = local.common_tags
+}
+
+# Diagnostics Storage Account
+resource "azurerm_storage_account" "diagnostics" {
+  name                     = "st${replace(var.project_name, "-", "")}diag${random_string.storage_suffix.result}"
+  resource_group_name      = azurerm_resource_group.storage.name
+  location                 = azurerm_resource_group.storage.location
+  account_tier             = "Standard"
+  account_replication_type = "GRS"  # Geo Redundant voor disaster recovery
+
+  https_traffic_only_enabled = true
+  min_tls_version           = "TLS1_2"
+
+  tags = local.common_tags
+}
+
+# Backup Storage Account voor Azure Site Recovery
+resource "azurerm_storage_account" "backup" {
+  name                     = "st${replace(var.project_name, "-", "")}backup${random_string.storage_suffix.result}"
+  resource_group_name      = azurerm_resource_group.storage.name
+  location                 = azurerm_resource_group.storage.location
+  account_tier             = "Standard"
+  account_replication_type = "GRS"
+
+  https_traffic_only_enabled = true
+  min_tls_version           = "TLS1_2"
+
+  tags = local.common_tags
+}
+
+# File Shares voor enterprise applications
+resource "azurerm_storage_share" "application_files" {
+  name                 = "${var.project_name}-application-files"
+  storage_account_name = azurerm_storage_account.main.name
+  quota                = 500  # 500GB voor enterprise gebruik
+}
+
+resource "azurerm_storage_share" "user_profiles" {
+  name                 = "${var.project_name}-user-profiles"
+  storage_account_name = azurerm_storage_account.main.name
+  quota                = 1000  # 1TB voor user profiles
+}
+
+# Storage Tables voor application data
+resource "azurerm_storage_table" "reservations" {
+  name                 = "reservations"
+  storage_account_name = azurerm_storage_account.main.name
+}
+
+resource "azurerm_storage_table" "hrm_data" {
+  name                 = "hrmdata"
+  storage_account_name = azurerm_storage_account.main.name
+}
+
+resource "azurerm_storage_table" "monitoring_logs" {
+  name                 = "monitoringlogs"
+  storage_account_name = azurerm_storage_account.main.name
+}
+
+# ==============================================================================
+# MONITORING RESOURCES - ENTERPRISE LEVEL
+# ==============================================================================
+
+resource "azurerm_resource_group" "monitoring" {
+  name     = "rg-${var.project_name}-monitoring"
+  location = var.location
+  tags     = local.common_tags
+}
+
+# Log Analytics Workspace - Enterprise configuration
+resource "azurerm_log_analytics_workspace" "main" {
+  name                = "law-${var.project_name}"
+  location            = azurerm_resource_group.monitoring.location
+  resource_group_name = azurerm_resource_group.monitoring.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 90  # Extended retention voor enterprise
+
+  tags = local.common_tags
+}
+
+# Application Insights voor web applications
+resource "azurerm_application_insights" "main" {
+  name                = "ai-${var.project_name}"
+  location            = azurerm_resource_group.monitoring.location
+  resource_group_name = azurerm_resource_group.monitoring.name
+  workspace_id        = azurerm_log_analytics_workspace.main.id
+  application_type    = "web"
+
+  tags = local.common_tags
+}
+
+# Application Insights voor reserveringssysteem
+resource "azurerm_application_insights" "reservations" {
+  name                = "ai-${var.project_name}-reservations"
+  location            = azurerm_resource_group.monitoring.location
+  resource_group_name = azurerm_resource_group.monitoring.name
+  workspace_id        = azurerm_log_analytics_workspace.main.id
+  application_type    = "web"
+
+  tags = local.common_tags
+}
+
+# Application Insights voor HRM systeem
+resource "azurerm_application_insights" "hrm" {
+  name                = "ai-${var.project_name}-hrm"
+  location            = azurerm_resource_group.monitoring.location
+  resource_group_name = azurerm_resource_group.monitoring.name
+  workspace_id        = azurerm_log_analytics_workspace.main.id
+  application_type    = "web"
+
+  tags = local.common_tags
+}
+
+# Action Groups voor alerting
+resource "azurerm_monitor_action_group" "critical" {
+  name                = "ag-${var.project_name}-critical"
+  resource_group_name = azurerm_resource_group.monitoring.name
+  short_name          = "critical"
+
+  email_receiver {
+    name          = "admin"
+    email_address = "560501@student.fontys.nl"
+  }
+
+  email_receiver {
+    name          = "it-team"
+    email_address = "it-team@fonteyn.corp"  # Placeholder
+  }
+
+  sms_receiver {
+    name         = "emergency"
+    country_code = "31"
+    phone_number = "0612345678"  # Placeholder
+  }
+
+  tags = local.common_tags
+}
+
+resource "azurerm_monitor_action_group" "warning" {
+  name                = "ag-${var.project_name}-warning"
+  resource_group_name = azurerm_resource_group.monitoring.name
+  short_name          = "warning"
+
+  email_receiver {
+    name          = "admin"
+    email_address = "560501@student.fontys.nl"
+  }
+
+  tags = local.common_tags
+}
+
+# ==============================================================================
+# AZURE SITE RECOVERY - DISASTER RECOVERY
+# ==============================================================================
+
+# Recovery Services Vault
+resource "azurerm_recovery_services_vault" "main" {
+  name                = "rsv-${var.project_name}"
+  location            = azurerm_resource_group.monitoring.location
+  resource_group_name = azurerm_resource_group.monitoring.name
+  sku                 = "Standard"
+  storage_mode_type   = "GeoRedundant"
+  cross_region_restore_enabled = true
+
+  tags = local.common_tags
+}
