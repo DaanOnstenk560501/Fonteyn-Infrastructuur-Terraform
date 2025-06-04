@@ -1629,3 +1629,557 @@ resource "azurerm_windows_virtual_machine" "azure_arc" {
     Application = "hybrid-management"
   })
 }
+
+# ==============================================================================
+# AZURE ARC CONFIGURATION - HYBRID CLOUD MANAGEMENT
+# ==============================================================================
+
+# Azure Arc Resource Group (dedicated voor hybrid management)
+resource "azurerm_resource_group" "azure_arc" {
+  name     = "rg-${var.project_name}-azure-arc"
+  location = var.location
+  tags     = local.common_tags
+}
+
+# Log Analytics Workspace voor Azure Arc (dedicated)
+resource "azurerm_log_analytics_workspace" "azure_arc" {
+  name                = "law-${var.project_name}-arc"
+  location            = azurerm_resource_group.azure_arc.location
+  resource_group_name = azurerm_resource_group.azure_arc.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 90
+
+  tags = merge(local.common_tags, {
+    Purpose = "azure-arc-hybrid-management"
+  })
+}
+
+# Azure Arc enabled servers - Resource Bridge (placeholder voor on-premises servers)
+# Deze worden gebruikt om on-premises servers te registreren bij Azure Arc
+
+# Service Principal voor Azure Arc (placeholder - manual setup required)
+resource "azurerm_user_assigned_identity" "azure_arc" {
+  name                = "id-${var.project_name}-arc"
+  location            = azurerm_resource_group.azure_arc.location
+  resource_group_name = azurerm_resource_group.azure_arc.name
+
+  tags = local.common_tags
+}
+
+# Role assignments voor Azure Arc service principal
+resource "azurerm_role_assignment" "azure_arc_contributor" {
+  scope                = azurerm_resource_group.azure_arc.id
+  role_definition_name = "Azure Connected Machine Resource Administrator"
+  principal_id         = azurerm_user_assigned_identity.azure_arc.principal_id
+}
+
+resource "azurerm_role_assignment" "azure_arc_monitoring" {
+  scope                = azurerm_log_analytics_workspace.azure_arc.id
+  role_definition_name = "Log Analytics Contributor"
+  principal_id         = azurerm_user_assigned_identity.azure_arc.principal_id
+}
+
+# ==============================================================================
+# AZURE POLICY ASSIGNMENTS - GOVERNANCE
+# ==============================================================================
+
+# Policy Assignment voor VM compliance monitoring
+resource "azurerm_resource_group_policy_assignment" "vm_monitoring" {
+  name                 = "vm-monitoring-policy"
+  resource_group_id    = azurerm_resource_group.compute.id
+  policy_definition_id = "/providers/Microsoft.Authorization/policyDefinitions/0868462e-646c-4fe3-9ced-a733534b6a2c" # Enable Azure Monitor for VMs
+
+  display_name = "Enable Azure Monitor for VMs in ${var.project_name}"
+  description  = "Ensures all VMs have Azure Monitor enabled for compliance"
+
+  parameters = jsonencode({
+    logAnalytics_1 = {
+      value = azurerm_log_analytics_workspace.main.id
+    }
+  })
+}
+
+# Policy Assignment voor disk encryption
+resource "azurerm_resource_group_policy_assignment" "disk_encryption" {
+  name                 = "disk-encryption-policy"
+  resource_group_id    = azurerm_resource_group.compute.id
+  policy_definition_id = "/providers/Microsoft.Authorization/policyDefinitions/0473574d-2d43-4217-aefe-941fcdf7e684" # Require encryption on VM disks
+
+  display_name = "Require disk encryption for ${var.project_name} VMs"
+  description  = "Ensures all VM disks are encrypted for security compliance"
+}
+
+# ==============================================================================
+# AZURE FIREWALL - ENHANCED SECURITY (Optional/Placeholder)
+# ==============================================================================
+
+# Azure Firewall Subnet (required naam)
+resource "azurerm_subnet" "firewall" {
+  name                 = "AzureFirewallSubnet"  # Mandatory name
+  resource_group_name  = azurerm_resource_group.network.name
+  virtual_network_name = azurerm_virtual_network.azure_enterprise.name
+  address_prefixes     = ["10.0.254.0/26"]  # /26 minimum voor Firewall subnet
+
+  depends_on = [azurerm_virtual_network.azure_enterprise]
+}
+
+# Azure Firewall Public IP
+resource "azurerm_public_ip" "firewall" {
+  count               = var.environment == "prod" ? 1 : 0  # Alleen in productie
+  name                = "pip-${var.project_name}-firewall"
+  location            = azurerm_resource_group.network.location
+  resource_group_name = azurerm_resource_group.network.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+
+  tags = merge(local.common_tags, {
+    Purpose = "azure-firewall-security"
+  })
+}
+
+# ==============================================================================
+# AUTOMATION & RUNBOOKS - OPERATIONAL EXCELLENCE
+# ==============================================================================
+
+resource "azurerm_automation_account" "main" {
+  name                = "aa-${var.project_name}"
+  location            = azurerm_resource_group.monitoring.location
+  resource_group_name = azurerm_resource_group.monitoring.name
+  sku_name            = "Basic"
+
+  tags = local.common_tags
+}
+
+# Link Automation Account to Log Analytics
+resource "azurerm_log_analytics_linked_service" "automation" {
+  resource_group_name = azurerm_resource_group.monitoring.name
+  workspace_id        = azurerm_log_analytics_workspace.main.id
+  read_access_id      = azurerm_automation_account.main.id
+}
+
+# Update Management Solution
+resource "azurerm_log_analytics_solution" "updates" {
+  solution_name         = "Updates"
+  location              = azurerm_resource_group.monitoring.location
+  resource_group_name   = azurerm_resource_group.monitoring.name
+  workspace_resource_id = azurerm_log_analytics_workspace.main.id
+  workspace_name        = azurerm_log_analytics_workspace.main.name
+
+  plan {
+    publisher = "Microsoft"
+    product   = "OMSGallery/Updates"
+  }
+}
+
+# ==============================================================================
+# BACKUP CONFIGURATION - AZURE SITE RECOVERY ENHANCED
+# ==============================================================================
+
+# Backup Policy voor VMs
+resource "azurerm_backup_policy_vm" "daily" {
+  name                = "backup-policy-daily"
+  resource_group_name = azurerm_resource_group.monitoring.name
+  recovery_vault_name = azurerm_recovery_services_vault.main.name
+
+  backup {
+    frequency = "Daily"
+    time      = "23:00"
+  }
+
+  retention_daily {
+    count = 30
+  }
+
+  retention_weekly {
+    count    = 12
+    weekdays = ["Sunday"]
+  }
+
+  retention_monthly {
+    count    = 12
+    weekdays = ["Sunday"]
+    weeks    = ["First"]
+  }
+}
+
+# Protected VM Backup Items (voor kritieke VMs)
+resource "azurerm_backup_protected_vm" "database" {
+  count               = var.database_instance_count
+  resource_group_name = azurerm_resource_group.monitoring.name
+  recovery_vault_name = azurerm_recovery_services_vault.main.name
+  source_vm_id        = azurerm_linux_virtual_machine.database[count.index].id
+  backup_policy_id    = azurerm_backup_policy_vm.daily.id
+}
+
+resource "azurerm_backup_protected_vm" "monitoring" {
+  resource_group_name = azurerm_resource_group.monitoring.name
+  recovery_vault_name = azurerm_recovery_services_vault.main.name
+  source_vm_id        = azurerm_linux_virtual_machine.monitoring.id
+  backup_policy_id    = azurerm_backup_policy_vm.daily.id
+}
+
+# ==============================================================================
+# AZURE AD CONNECT PREPARATION (Placeholder)
+# ==============================================================================
+
+# Key Vault secrets voor Azure AD Connect
+resource "azurerm_key_vault_secret" "aad_connect_service_account" {
+  name         = "aad-connect-service-account"
+  value        = "FONTEYN\\svc-aadconnect"  # Service account voor AD Connect
+  key_vault_id = azurerm_key_vault.main.id
+
+  depends_on = [azurerm_key_vault_access_policy.current_user]
+  tags       = local.common_tags
+}
+
+resource "random_password" "aad_connect_password" {
+  length  = 24
+  special = true
+  upper   = true
+  lower   = true
+  numeric = true
+}
+
+resource "azurerm_key_vault_secret" "aad_connect_password" {
+  name         = "aad-connect-service-password"
+  value        = random_password.aad_connect_password.result
+  key_vault_id = azurerm_key_vault.main.id
+
+  depends_on = [azurerm_key_vault_access_policy.current_user]
+  tags       = local.common_tags
+}
+
+# ==============================================================================
+# MONITORING ALERTS - ENTERPRISE LEVEL
+# ==============================================================================
+
+# CPU Alert voor alle VMs
+resource "azurerm_monitor_metric_alert" "high_cpu" {
+  name                = "alert-${var.project_name}-high-cpu"
+  resource_group_name = azurerm_resource_group.monitoring.name
+  scopes              = [azurerm_resource_group.compute.id]
+  description         = "Alert when CPU usage is higher than 80%"
+
+  criteria {
+    metric_namespace = "Microsoft.Compute/virtualMachines"
+    metric_name      = "Percentage CPU"
+    aggregation      = "Average"
+    operator         = "GreaterThan"
+    threshold        = 80
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.critical.id
+  }
+
+  frequency   = "PT5M"
+  window_size = "PT15M"
+  severity    = 2
+
+  tags = local.common_tags
+}
+
+# Memory Alert voor Database VMs
+resource "azurerm_monitor_metric_alert" "high_memory" {
+  name                = "alert-${var.project_name}-high-memory"
+  resource_group_name = azurerm_resource_group.monitoring.name
+  scopes = [
+    for vm in azurerm_linux_virtual_machine.database : vm.id
+  ]
+  description = "Alert when memory usage is higher than 85%"
+
+  criteria {
+    metric_namespace = "Microsoft.Compute/virtualMachines"
+    metric_name      = "Available Memory Bytes"
+    aggregation      = "Average"
+    operator         = "LessThan"
+    threshold        = 1073741824  # 1GB in bytes
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.critical.id
+  }
+
+  frequency   = "PT5M"
+  window_size = "PT15M"
+  severity    = 1
+
+  tags = local.common_tags
+}
+
+# VPN Gateway Connection Alert
+resource "azurerm_monitor_metric_alert" "vpn_disconnected" {
+  name                = "alert-${var.project_name}-vpn-disconnected"
+  resource_group_name = azurerm_resource_group.monitoring.name
+  scopes              = [azurerm_virtual_network_gateway.vpn.id]
+  description         = "Alert when VPN connection is down"
+
+  criteria {
+    metric_namespace = "Microsoft.Network/virtualNetworkGateways"
+    metric_name      = "TunnelState"
+    aggregation      = "Maximum"
+    operator         = "LessThan"
+    threshold        = 1
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.critical.id
+  }
+
+  frequency   = "PT1M"
+  window_size = "PT5M"
+  severity    = 0  # Critical
+
+  tags = local.common_tags
+}
+
+# ==============================================================================
+# OUTPUTS - COMPREHENSIVE ENTERPRISE DEPLOYMENT INFORMATION
+# ==============================================================================
+
+output "deployment_information" {
+  description = "Complete deployment information for Fonteyn Enterprise"
+  value = {
+    project_details = {
+      name         = var.project_name
+      environment  = var.environment
+      location     = var.location
+      deployed_at  = timestamp()
+      terraform_version = "managed-by-terraform"
+    }
+
+    network_configuration = {
+      azure_vnet = {
+        name          = azurerm_virtual_network.azure_enterprise.name
+        address_space = var.azure_vnet_address_space
+        resource_group = azurerm_resource_group.network.name
+      }
+      
+      subnets = {
+        dmz         = var.dmz_subnet_prefix
+        frontend    = var.frontend_subnet_prefix
+        backend     = var.backend_subnet_prefix
+        database    = var.database_subnet_prefix
+        management  = var.management_subnet_prefix
+        azure_arc   = var.azure_arc_subnet_prefix
+        gateway     = "10.0.255.0/27"
+        firewall    = "10.0.254.0/26"
+      }
+
+      vpn_gateway = {
+        public_ip    = azurerm_public_ip.vpn_gateway.ip_address
+        gateway_name = azurerm_virtual_network_gateway.vpn.name
+        sku         = "VpnGw2"
+        generation  = "Generation2"
+      }
+
+      load_balancers = {
+        dmz_public_ip = azurerm_public_ip.dmz_lb_public_ip.ip_address
+        internal_ip   = azurerm_lb.internal.frontend_ip_configuration[0].private_ip_address
+      }
+    }
+
+    virtual_machines = {
+      web_servers = {
+        count = var.frontend_instance_count
+        size  = var.frontend_vm_size
+        ips   = [for vm in azurerm_linux_virtual_machine.web : azurerm_network_interface.web[index(azurerm_linux_virtual_machine.web, vm)].ip_configuration[0].private_ip_address]
+      }
+      
+      app_servers = {
+        count = var.backend_instance_count
+        size  = var.backend_vm_size
+        ips   = [for vm in azurerm_linux_virtual_machine.app : azurerm_network_interface.app[index(azurerm_linux_virtual_machine.app, vm)].ip_configuration[0].private_ip_address]
+      }
+      
+      database_servers = {
+        count = var.database_instance_count
+        size  = var.database_vm_size
+        ips   = [for vm in azurerm_linux_virtual_machine.database : azurerm_network_interface.database[index(azurerm_linux_virtual_machine.database, vm)].ip_configuration[0].private_ip_address]
+      }
+
+      management_servers = {
+        monitoring = {
+          ip   = azurerm_network_interface.monitoring.ip_configuration[0].private_ip_address
+          size = var.monitoring_vm_size
+        }
+        print_server = {
+          ip   = azurerm_network_interface.printserver.ip_configuration[0].private_ip_address
+          size = var.printserver_vm_size
+        }
+        azure_arc = {
+          ip   = azurerm_network_interface.azure_arc.ip_configuration[0].private_ip_address
+          size = var.monitoring_vm_size
+        }
+      }
+    }
+
+    security_and_storage = {
+      key_vault = {
+        name = azurerm_key_vault.main.name
+        uri  = azurerm_key_vault.main.vault_uri
+      }
+      
+      storage_accounts = {
+        main        = azurerm_storage_account.main.name
+        diagnostics = azurerm_storage_account.diagnostics.name
+        backup      = azurerm_storage_account.backup.name
+      }
+
+      backup_vault = azurerm_recovery_services_vault.main.name
+    }
+
+    monitoring_and_management = {
+      log_analytics = {
+        main      = azurerm_log_analytics_workspace.main.name
+        azure_arc = azurerm_log_analytics_workspace.azure_arc.name
+      }
+      
+      application_insights = {
+        main         = azurerm_application_insights.main.name
+        reservations = azurerm_application_insights.reservations.name
+        hrm          = azurerm_application_insights.hrm.name
+      }
+
+      automation_account = azurerm_automation_account.main.name
+      
+      action_groups = {
+        critical = azurerm_monitor_action_group.critical.name
+        warning  = azurerm_monitor_action_group.warning.name
+      }
+    }
+
+    hybrid_cloud_integration = {
+      azure_arc = {
+        resource_group      = azurerm_resource_group.azure_arc.name
+        identity_name       = azurerm_user_assigned_identity.azure_arc.name
+        log_analytics       = azurerm_log_analytics_workspace.azure_arc.name
+      }
+
+      on_premises_connectivity = {
+        networks = var.on_premises_networks
+        dns_servers = var.on_premises_dns_servers
+        gateway_ip = var.hoofdkantoor_gateway_ip
+      }
+    }
+  }
+}
+
+output "connection_information" {
+  description = "How to connect to and manage the infrastructure"
+  value = {
+    web_access = {
+      public_url = "https://${azurerm_public_ip.dmz_lb_public_ip.ip_address}"
+      load_balancer = "DMZ Load Balancer with SSL termination"
+    }
+
+    vm_access = {
+      ssh_key_location = "Use terraform output ssh_private_key"
+      jump_host = "Connect via management subnet or VPN"
+      
+      connection_examples = {
+        web_server = "ssh -i ssh_key.pem ${var.admin_username}@${azurerm_network_interface.web[0].ip_configuration[0].private_ip_address}"
+        database   = "ssh -i ssh_key.pem ${var.admin_username}@${azurerm_network_interface.database[0].ip_configuration[0].private_ip_address}"
+        monitoring = "ssh -i ssh_key.pem ${var.admin_username}@${azurerm_network_interface.monitoring.ip_configuration[0].private_ip_address}"
+      }
+    }
+
+    management_access = {
+      azure_portal = "https://portal.azure.com"
+      key_vault = azurerm_key_vault.main.vault_uri
+      log_analytics = "Search for: ${azurerm_log_analytics_workspace.main.name}"
+    }
+
+    vpn_configuration = {
+      azure_gateway_ip = azurerm_public_ip.vpn_gateway.ip_address
+      shared_key_location = "Key Vault secret: vpn-shared-key-hoofdkantoor"
+      local_networks = var.on_premises_networks
+      
+      pfsense_setup = {
+        remote_gateway = azurerm_public_ip.vpn_gateway.ip_address
+        local_networks = var.on_premises_networks
+        azure_networks = [var.azure_vnet_address_space]
+        protocol = "IKEv2"
+        encryption = "AES-256"
+      }
+    }
+  }
+}
+
+output "next_steps" {
+  description = "Post-deployment configuration steps"
+  value = {
+    immediate_tasks = [
+      "1. Save SSH private key: terraform output -raw ssh_private_key > ssh_key.pem",
+      "2. Set SSH key permissions: chmod 600 ssh_key.pem",
+      "3. Configure pfSense VPN with Azure gateway IP: ${azurerm_public_ip.vpn_gateway.ip_address}",
+      "4. Test VPN connectivity between Azure and on-premises",
+      "5. Install Azure Arc agent on on-premises servers"
+    ]
+
+    azure_arc_setup = [
+      "1. Download Azure Arc installation script from Azure portal",
+      "2. Run on FONTDC01 (192.168.2.100) and FONTDC02 (192.168.2.99)",
+      "3. Install on file server and print server (VLAN B)",
+      "4. Configure monitoring and policy compliance"
+    ]
+
+    application_deployment = [
+      "1. Configure web servers with Nginx/Apache",
+      "2. Deploy reservation system on app servers",
+      "3. Set up database cluster (MySQL/PostgreSQL)",
+      "4. Configure monitoring dashboards",
+      "5. Set up backup schedules"
+    ]
+
+    security_hardening = [
+      "1. Review and adjust NSG rules",
+      "2. Configure Azure AD Connect for identity sync",
+      "3. Enable Azure Security Center recommendations",
+      "4. Set up certificate management for SSL",
+      "5. Configure audit logging"
+    ]
+
+    cost_optimization = [
+      "1. Monitor resource utilization",
+      "2. Consider scaling down non-production VMs",
+      "3. Set up budget alerts",
+      "4. Review storage account tiers",
+      "5. Optimize backup retention policies"
+    ]
+
+    future_expansions = [
+      "1. Add vakantiepark NL gateway and connectivity",
+      "2. Add vakantiepark BE gateway and connectivity", 
+      "3. Add vakantiepark DE gateway and connectivity",
+      "4. Implement Azure Firewall for enhanced security",
+      "5. Consider Azure Virtual Desktop for remote workers"
+    ]
+  }
+}
+
+output "ssh_private_key" {
+  description = "SSH private key for VM access"
+  value       = tls_private_key.ssh.private_key_pem
+  sensitive   = true
+}
+
+output "cost_information" {
+  description = "Cost optimization and monitoring information"
+  value = {
+    current_configuration = "Testing/Development optimized"
+    estimated_monthly_cost = "€200-400 (with testing VM sizes)"
+    enterprise_monthly_cost = "€2,500-4,000 (with enterprise VM sizes)"
+    
+    cost_drivers = {
+      largest_costs = ["Virtual Machines", "VPN Gateway", "Storage Accounts", "Load Balancers"]
+      optimization_opportunities = ["Right-size VMs", "Reserved Instances", "Storage tiers"]
+    }
+
+    monitoring = {
+      cost_alerts = "Set up in Azure portal under Cost Management"
+      budgets = "Configure monthly spending limits"
+      recommendations = "Review Azure Advisor cost recommendations"
+    }
+  }
+}
