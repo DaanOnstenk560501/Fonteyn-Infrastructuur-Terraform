@@ -1003,3 +1003,629 @@ resource "azurerm_recovery_services_vault" "main" {
 
   tags = local.common_tags
 }
+
+# ==============================================================================
+# COMPUTE RESOURCES - ENTERPRISE ARCHITECTURE
+# ==============================================================================
+
+resource "azurerm_resource_group" "compute" {
+  name     = "rg-${var.project_name}-compute"
+  location = var.location
+  tags     = local.common_tags
+}
+
+# ==============================================================================
+# LOAD BALANCERS - DMZ EN INTERNAL
+# ==============================================================================
+
+# DMZ Load Balancer - Public facing
+resource "azurerm_public_ip" "dmz_lb_public_ip" {
+  name                = "pip-${var.project_name}-dmz-lb"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+
+  tags = local.common_tags
+}
+
+resource "azurerm_lb" "dmz" {
+  name                = "lb-${var.project_name}-dmz"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+  sku                 = "Standard"
+
+  frontend_ip_configuration {
+    name                 = "DMZ-PublicIP"
+    public_ip_address_id = azurerm_public_ip.dmz_lb_public_ip.id
+  }
+
+  tags = local.common_tags
+}
+
+resource "azurerm_lb_backend_address_pool" "dmz" {
+  loadbalancer_id = azurerm_lb.dmz.id
+  name            = "DMZ-BackendPool"
+}
+
+resource "azurerm_lb_probe" "dmz_https" {
+  loadbalancer_id = azurerm_lb.dmz.id
+  name            = "https-probe"
+  port            = 443
+  protocol        = "Https"
+  request_path    = "/health"
+}
+
+resource "azurerm_lb_rule" "dmz_https" {
+  loadbalancer_id                = azurerm_lb.dmz.id
+  name                           = "HTTPS"
+  protocol                       = "Tcp"
+  frontend_port                  = 443
+  backend_port                   = 443
+  frontend_ip_configuration_name = "DMZ-PublicIP"
+  backend_address_pool_ids       = [azurerm_lb_backend_address_pool.dmz.id]
+  probe_id                      = azurerm_lb_probe.dmz_https.id
+}
+
+resource "azurerm_lb_rule" "dmz_http_redirect" {
+  loadbalancer_id                = azurerm_lb.dmz.id
+  name                           = "HTTP-Redirect"
+  protocol                       = "Tcp"
+  frontend_port                  = 80
+  backend_port                   = 80
+  frontend_ip_configuration_name = "DMZ-PublicIP"
+  backend_address_pool_ids       = [azurerm_lb_backend_address_pool.dmz.id]
+}
+
+# Internal Load Balancer voor backend services
+resource "azurerm_lb" "internal" {
+  name                = "lb-${var.project_name}-internal"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+  sku                 = "Standard"
+
+  frontend_ip_configuration {
+    name                          = "Internal-Frontend"
+    subnet_id                     = azurerm_subnet.backend.id
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = local.common_tags
+}
+
+resource "azurerm_lb_backend_address_pool" "internal" {
+  loadbalancer_id = azurerm_lb.internal.id
+  name            = "Internal-BackendPool"
+}
+
+resource "azurerm_lb_probe" "internal_app" {
+  loadbalancer_id = azurerm_lb.internal.id
+  name            = "app-probe"
+  port            = 8080
+  protocol        = "Http"
+  request_path    = "/health"
+}
+
+resource "azurerm_lb_rule" "internal_app" {
+  loadbalancer_id                = azurerm_lb.internal.id
+  name                           = "Application"
+  protocol                       = "Tcp"
+  frontend_port                  = 8080
+  backend_port                   = 8080
+  frontend_ip_configuration_name = "Internal-Frontend"
+  backend_address_pool_ids       = [azurerm_lb_backend_address_pool.internal.id]
+  probe_id                      = azurerm_lb_probe.internal_app.id
+}
+
+# ==============================================================================
+# AVAILABILITY SETS - ENTERPRISE HA
+# ==============================================================================
+
+resource "azurerm_availability_set" "web" {
+  name                = "avset-web"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+  managed             = true
+  platform_fault_domain_count = 3
+  platform_update_domain_count = 5
+
+  tags = local.common_tags
+}
+
+resource "azurerm_availability_set" "app" {
+  name                = "avset-app"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+  managed             = true
+  platform_fault_domain_count = 3
+  platform_update_domain_count = 5
+
+  tags = local.common_tags
+}
+
+resource "azurerm_availability_set" "database" {
+  name                = "avset-database"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+  managed             = true
+  platform_fault_domain_count = 3
+  platform_update_domain_count = 5
+
+  tags = local.common_tags
+}
+
+# ==============================================================================
+# NETWORK INTERFACES - ENTERPRISE SETUP
+# ==============================================================================
+
+# Frontend Web Server NICs
+resource "azurerm_network_interface" "web" {
+  count               = var.frontend_instance_count
+  name                = "nic-web-${format("%02d", count.index + 1)}"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.frontend.id
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = local.common_tags
+}
+
+# Backend Application Server NICs
+resource "azurerm_network_interface" "app" {
+  count               = var.backend_instance_count
+  name                = "nic-app-${format("%02d", count.index + 1)}"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.backend.id
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = local.common_tags
+}
+
+# Database Server NICs
+resource "azurerm_network_interface" "database" {
+  count               = var.database_instance_count
+  name                = "nic-db-${format("%02d", count.index + 1)}"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.database.id
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = local.common_tags
+}
+
+# Monitoring Server NIC
+resource "azurerm_network_interface" "monitoring" {
+  name                = "nic-monitoring-01"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.management.id
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = local.common_tags
+}
+
+# Print Server NIC
+resource "azurerm_network_interface" "printserver" {
+  name                = "nic-printserver-01"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.management.id
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = local.common_tags
+}
+
+# Azure Arc Management Server NIC
+resource "azurerm_network_interface" "azure_arc" {
+  name                = "nic-azure-arc-01"
+  location            = azurerm_resource_group.compute.location
+  resource_group_name = azurerm_resource_group.compute.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.azure_arc.id
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = local.common_tags
+}
+
+# ==============================================================================
+# LOAD BALANCER ASSOCIATIONS
+# ==============================================================================
+
+# DMZ Load Balancer associations voor web servers
+resource "azurerm_network_interface_backend_address_pool_association" "web_dmz" {
+  count                   = var.frontend_instance_count
+  network_interface_id    = azurerm_network_interface.web[count.index].id
+  ip_configuration_name   = "internal"
+  backend_address_pool_id = azurerm_lb_backend_address_pool.dmz.id
+}
+
+# Internal Load Balancer associations voor app servers
+resource "azurerm_network_interface_backend_address_pool_association" "app_internal" {
+  count                   = var.backend_instance_count
+  network_interface_id    = azurerm_network_interface.app[count.index].id
+  ip_configuration_name   = "internal"
+  backend_address_pool_id = azurerm_lb_backend_address_pool.internal.id
+}
+
+# ==============================================================================
+# VIRTUAL MACHINES - ENTERPRISE CONFIGURATION
+# ==============================================================================
+
+# Frontend Web Servers (D8s_v5)
+resource "azurerm_linux_virtual_machine" "web" {
+  count               = var.frontend_instance_count
+  name                = "vm-web-${format("%02d", count.index + 1)}"
+  resource_group_name = azurerm_resource_group.compute.name
+  location            = azurerm_resource_group.compute.location
+  size                = var.frontend_vm_size  # Standard_D8s_v5
+  admin_username      = var.admin_username
+  availability_set_id = azurerm_availability_set.web.id
+
+  disable_password_authentication = true
+
+  network_interface_ids = [
+    azurerm_network_interface.web[count.index].id,
+  ]
+
+  admin_ssh_key {
+    username   = var.admin_username
+    public_key = tls_private_key.ssh.public_key_openssh
+  }
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"  # Goedkoper voor testing
+    disk_size_gb         = 64              # Kleiner voor testing
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-focal"
+    sku       = "20_04-lts-gen2"
+    version   = "latest"
+  }
+
+  boot_diagnostics {
+    storage_account_uri = azurerm_storage_account.diagnostics.primary_blob_endpoint
+  }
+
+  tags = merge(local.common_tags, {
+    Role        = "webserver"
+    Tier        = "frontend"
+    Application = "nginx-apache"
+  })
+}
+
+# Data disks voor web servers
+resource "azurerm_managed_disk" "web_data" {
+  count                = var.frontend_instance_count
+  name                 = "disk-web-${format("%02d", count.index + 1)}-data"
+  location             = azurerm_resource_group.compute.location
+  resource_group_name  = azurerm_resource_group.compute.name
+  storage_account_type = "Standard_LRS"
+  create_option        = "Empty"
+  disk_size_gb         = 64
+
+  tags = local.common_tags
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "web_data" {
+  count              = var.frontend_instance_count
+  managed_disk_id    = azurerm_managed_disk.web_data[count.index].id
+  virtual_machine_id = azurerm_linux_virtual_machine.web[count.index].id
+  lun                = "0"
+  caching            = "ReadOnly"
+}
+
+# Backend Application Servers (D16s_v5)
+resource "azurerm_linux_virtual_machine" "app" {
+  count               = var.backend_instance_count
+  name                = "vm-app-${format("%02d", count.index + 1)}"
+  resource_group_name = azurerm_resource_group.compute.name
+  location            = azurerm_resource_group.compute.location
+  size                = var.backend_vm_size  # Standard_D16s_v5
+  admin_username      = var.admin_username
+  availability_set_id = azurerm_availability_set.app.id
+
+  disable_password_authentication = true
+
+  network_interface_ids = [
+    azurerm_network_interface.app[count.index].id,
+  ]
+
+  admin_ssh_key {
+    username   = var.admin_username
+    public_key = tls_private_key.ssh.public_key_openssh
+  }
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"  # Goedkoper voor testing
+    disk_size_gb         = 64              # Kleiner voor testing
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-focal"
+    sku       = "20_04-lts-gen2"
+    version   = "latest"
+  }
+
+  boot_diagnostics {
+    storage_account_uri = azurerm_storage_account.diagnostics.primary_blob_endpoint
+  }
+
+  tags = merge(local.common_tags, {
+    Role        = "appserver"
+    Tier        = "backend"
+    Application = "reservations-hrm"
+  })
+}
+
+# Data disks voor app servers
+resource "azurerm_managed_disk" "app_data" {
+  count                = var.backend_instance_count
+  name                 = "disk-app-${format("%02d", count.index + 1)}-data"
+  location             = azurerm_resource_group.compute.location
+  resource_group_name  = azurerm_resource_group.compute.name
+  storage_account_type = "Standard_LRS"
+  create_option        = "Empty"
+  disk_size_gb         = 128
+
+  tags = local.common_tags
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "app_data" {
+  count              = var.backend_instance_count
+  managed_disk_id    = azurerm_managed_disk.app_data[count.index].id
+  virtual_machine_id = azurerm_linux_virtual_machine.app[count.index].id
+  lun                = "0"
+  caching            = "ReadWrite"
+}
+
+# Database Servers (E16ds_v5 - Memory Optimized)
+resource "azurerm_linux_virtual_machine" "database" {
+  count               = var.database_instance_count
+  name                = "vm-db-${format("%02d", count.index + 1)}"
+  resource_group_name = azurerm_resource_group.compute.name
+  location            = azurerm_resource_group.compute.location
+  size                = var.database_vm_size  # Standard_E16ds_v5
+  admin_username      = var.admin_username
+  availability_set_id = azurerm_availability_set.database.id
+
+  disable_password_authentication = true
+
+  network_interface_ids = [
+    azurerm_network_interface.database[count.index].id,
+  ]
+
+  admin_ssh_key {
+    username   = var.admin_username
+    public_key = tls_private_key.ssh.public_key_openssh
+  }
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"  # Goedkoper voor testing
+    disk_size_gb         = 64              # Kleiner voor testing
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-focal"
+    sku       = "20_04-lts-gen2"
+    version   = "latest"
+  }
+
+  boot_diagnostics {
+    storage_account_uri = azurerm_storage_account.diagnostics.primary_blob_endpoint
+  }
+
+  tags = merge(local.common_tags, {
+    Role        = "database"
+    Tier        = "data"
+    Application = "mysql-postgresql"
+  })
+}
+
+# Database data disks
+resource "azurerm_managed_disk" "database_data" {
+  count                = var.database_instance_count
+  name                 = "disk-db-${format("%02d", count.index + 1)}-data"
+  location             = azurerm_resource_group.compute.location
+  resource_group_name  = azurerm_resource_group.compute.name
+  storage_account_type = "Standard_LRS"
+  create_option        = "Empty"
+  disk_size_gb         = 128
+
+  tags = local.common_tags
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "database_data" {
+  count              = var.database_instance_count
+  managed_disk_id    = azurerm_managed_disk.database_data[count.index].id
+  virtual_machine_id = azurerm_linux_virtual_machine.database[count.index].id
+  lun                = "0"
+  caching            = "ReadWrite"
+}
+
+# Database log disks
+resource "azurerm_managed_disk" "database_log" {
+  count                = var.database_instance_count
+  name                 = "disk-db-${format("%02d", count.index + 1)}-log"
+  location             = azurerm_resource_group.compute.location
+  resource_group_name  = azurerm_resource_group.compute.name
+  storage_account_type = "Standard_LRS"
+  create_option        = "Empty"
+  disk_size_gb         = 32
+
+  tags = local.common_tags
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "database_log" {
+  count              = var.database_instance_count
+  managed_disk_id    = azurerm_managed_disk.database_log[count.index].id
+  virtual_machine_id = azurerm_linux_virtual_machine.database[count.index].id
+  lun                = "1"
+  caching            = "None"
+}
+
+# Monitoring Server (D8s_v5)
+resource "azurerm_linux_virtual_machine" "monitoring" {
+  name                = "vm-monitoring-01"
+  resource_group_name = azurerm_resource_group.compute.name
+  location            = azurerm_resource_group.compute.location
+  size                = var.monitoring_vm_size  # Standard_D8s_v5
+  admin_username      = var.admin_username
+
+  disable_password_authentication = true
+
+  network_interface_ids = [
+    azurerm_network_interface.monitoring.id,
+  ]
+
+  admin_ssh_key {
+    username   = var.admin_username
+    public_key = tls_private_key.ssh.public_key_openssh
+  }
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"  # Goedkoper voor testing
+    disk_size_gb         = 64              # Kleiner voor testing
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-focal"
+    sku       = "20_04-lts-gen2"
+    version   = "latest"
+  }
+
+  boot_diagnostics {
+    storage_account_uri = azurerm_storage_account.diagnostics.primary_blob_endpoint
+  }
+
+  tags = merge(local.common_tags, {
+    Role        = "monitoring"
+    Tier        = "management"
+    Application = "azure-monitor-grafana"
+  })
+}
+
+# Monitoring data disk
+resource "azurerm_managed_disk" "monitoring_data" {
+  name                 = "disk-monitoring-01-data"
+  location             = azurerm_resource_group.compute.location
+  resource_group_name  = azurerm_resource_group.compute.name
+  storage_account_type = "Standard_LRS"
+  create_option        = "Empty"
+  disk_size_gb         = 64
+
+  tags = local.common_tags
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "monitoring_data" {
+  managed_disk_id    = azurerm_managed_disk.monitoring_data.id
+  virtual_machine_id = azurerm_linux_virtual_machine.monitoring.id
+  lun                = "0"
+  caching            = "ReadWrite"
+}
+
+# Print Server (D4s_v5)
+resource "azurerm_windows_virtual_machine" "printserver" {
+  name                = "vm-printserver-01"
+  resource_group_name = azurerm_resource_group.compute.name
+  location            = azurerm_resource_group.compute.location
+  size                = var.printserver_vm_size  # Standard_D4s_v5
+  admin_username      = var.admin_username
+  admin_password      = random_password.sql_admin.result  # Hergebruik secure password
+
+  network_interface_ids = [
+    azurerm_network_interface.printserver.id,
+  ]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"  # Goedkoper voor testing
+    disk_size_gb         = 64              # Kleiner voor testing
+  }
+
+  source_image_reference {
+    publisher = "MicrosoftWindowsServer"
+    offer     = "WindowsServer"
+    sku       = "2022-datacenter-g2"
+    version   = "latest"
+  }
+
+  boot_diagnostics {
+    storage_account_uri = azurerm_storage_account.diagnostics.primary_blob_endpoint
+  }
+
+  tags = merge(local.common_tags, {
+    Role        = "printserver"
+    Tier        = "management"
+    Application = "windows-print-services"
+  })
+}
+
+# Azure Arc Management Server (Windows voor AD integration)
+resource "azurerm_windows_virtual_machine" "azure_arc" {
+  name                = "vm-azure-arc-01"
+  resource_group_name = azurerm_resource_group.compute.name
+  location            = azurerm_resource_group.compute.location
+  size                = var.monitoring_vm_size  # Standard_D8s_v5
+  admin_username      = var.admin_username
+  admin_password      = random_password.sql_admin.result
+
+  network_interface_ids = [
+    azurerm_network_interface.azure_arc.id,
+  ]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"  # Goedkoper voor testing
+    disk_size_gb         = 64              # Kleiner voor testing
+  }
+
+  source_image_reference {
+    publisher = "MicrosoftWindowsServer"
+    offer     = "WindowsServer"
+    sku       = "2022-datacenter-g2"
+    version   = "latest"
+  }
+
+  boot_diagnostics {
+    storage_account_uri = azurerm_storage_account.diagnostics.primary_blob_endpoint
+  }
+
+  tags = merge(local.common_tags, {
+    Role        = "azure-arc"
+    Tier        = "management"
+    Application = "hybrid-management"
+  })
+}
